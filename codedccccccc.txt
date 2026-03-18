@@ -1,0 +1,314 @@
+Tu as raison ! On avait décidé cette architecture avant. Voici les fichiers corrigés :
+
+---
+
+### `dags/tasks.py`
+
+```python
+import os
+import json
+import time
+import requests
+import psycopg2
+from datetime import timedelta
+
+# ════════════════════════════════════════
+# CONFIG
+# ════════════════════════════════════════
+
+DB_CONFIG = {
+    "host"    : "host.docker.internal",
+    "port"    : 5432,
+    "database": "retail_pricing",
+    "user"    : "postgres",
+    "password": "admin123"
+}
+
+API_URL  = "https://prices.openfoodfacts.org/api/v1/prices"
+TMP_PATH = "/tmp/airflow_data"
+SEUIL_ML = 1000
+
+# ════════════════════════════════════════
+# UTILS
+# ════════════════════════════════════════
+
+def get_db_connection():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def get_watermark(dataset_name):
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT last_processed_date FROM watermark WHERE dataset_name=%s",
+        (dataset_name,)
+    )
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return result[0]
+
+
+def update_watermark(dataset_name, new_date):
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE watermark SET last_processed_date=%s, updated_at=NOW() WHERE dataset_name=%s",
+        (str(new_date), dataset_name)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print(f"Watermark mis à jour : {dataset_name} → {new_date}")
+
+
+def log_pipeline(dag_name, task_name, rows_inserted=0, rows_updated=0,
+                 rows_rejected=0, status="success", duration=0, error=None):
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO pipeline_logs
+        (dag_name, task_name, run_date, rows_inserted, rows_updated,
+         rows_rejected, status, duration_seconds, error_message)
+        VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+    """, (dag_name, task_name, rows_inserted, rows_updated,
+          rows_rejected, status, duration, error))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def inserer_erreur(source_dag, item, raison):
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO prices_errors
+            (source_dag, product_code, raw_price, raw_date, raw_data, rejection_reason)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            source_dag,
+            item.get("product_code"),
+            str(item.get("price")),
+            str(item.get("date")),
+            json.dumps(item),
+            raison
+        ))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Erreur insertion prices_errors : {e}")
+
+
+# ════════════════════════════════════════
+# T1 — EXTRACT + LOAD
+# ════════════════════════════════════════
+
+def telecharger_et_inserer_prices():
+    os.makedirs(TMP_PATH, exist_ok=True)
+    start_time = time.time()
+
+    # watermark - 5 minutes pour éviter overlap
+    last_date = get_watermark('prices') - timedelta(minutes=5)
+    print(f"Delta depuis {last_date} → API")
+
+    params    = {
+        "updated__gte": str(last_date),
+        "size"        : 100,
+        "page"        : 1
+    }
+    all_items = []
+
+    # ── Extract ──────────────────────────
+    while True:
+        data = None
+        for tentative in range(3):
+            try:
+                response = requests.get(API_URL, params=params, timeout=30)
+                data     = response.json()
+                break
+            except Exception as e:
+                print(f"Erreur page {params['page']} tentative {tentative+1}: {e}")
+                time.sleep(5)
+
+        if data is None:
+            raise Exception(f"Page {params['page']} inaccessible après 3 tentatives")
+
+        if "items" not in data:
+            raise Exception(f"Réponse inattendue page {params['page']} : {data}")
+
+        all_items.extend(data["items"])
+        print(f"page {params['page']}/{data['pages']} - {len(all_items)} lignes")
+
+        if params["page"] >= data["pages"]:
+            break
+        params["page"] += 1
+
+    if len(all_items) == 0:
+        print("Aucune nouvelle donnée")
+        return
+
+    print(f"Téléchargé : {len(all_items)} lignes")
+
+    # ── Load → prices_raw ────────────────
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+
+    rows_inserted = 0
+    rows_updated  = 0
+    rows_rejected = 0
+
+    for item in all_items:
+        try:
+            cursor.execute("""
+                INSERT INTO prices_raw (id, raw_data, inserted_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (id)
+                DO UPDATE SET
+                    raw_data    = EXCLUDED.raw_data,
+                    inserted_at = NOW()
+            """, (item["id"], json.dumps(item)))
+
+            rows_inserted += 1
+
+        except Exception as e:
+            rows_rejected += 1
+            print(f"Erreur insertion id={item.get('id')}: {e}")
+            inserer_erreur("pipeline_prices", item, str(e))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    # ── Watermark ────────────────────────
+    max_updated = max(item["updated"] for item in all_items)
+    update_watermark("prices", max_updated)
+
+    duration = time.time() - start_time
+
+    log_pipeline(
+        dag_name      = "pipeline_prices",
+        task_name     = "telecharger_et_inserer_prices",
+        rows_inserted = rows_inserted,
+        rows_updated  = rows_updated,
+        rows_rejected = rows_rejected,
+        status        = "success",
+        duration      = duration
+    )
+
+    print(f"Inséré : {rows_inserted} | Mis à jour : {rows_updated} | Rejeté : {rows_rejected}")
+
+
+# ════════════════════════════════════════
+# T3 — LOGGER + SEUIL ML
+# ════════════════════════════════════════
+
+def logger_et_verifier_seuil(**context):
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+
+    # total lignes traitées aujourd'hui
+    cursor.execute("""
+        SELECT COALESCE(SUM(rows_inserted + rows_updated), 0)
+        FROM pipeline_logs
+        WHERE dag_name = 'pipeline_prices'
+        AND DATE(run_date) = CURRENT_DATE
+    """)
+    total = cursor.fetchone()[0]
+    cursor.close()
+    conn.close()
+
+    print(f"Total lignes aujourd'hui : {total} | Seuil ML : {SEUIL_ML}")
+
+    if total >= SEUIL_ML:
+        print("Seuil ML atteint → trigger pipeline_ml")
+        return "trigger_ml"
+    else:
+        print("Seuil ML non atteint → fin")
+        return "fin"
+```
+
+---
+
+### `dags/pipeline_prices.py`
+
+```python
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.operators.empty import EmptyOperator
+from datetime import datetime, timedelta
+from tasks import telecharger_et_inserer_prices, logger_et_verifier_seuil
+
+with DAG(
+    dag_id="pipeline_prices",
+    start_date=datetime.now(),
+    schedule="@daily",
+    catchup=False
+) as dag:
+
+    # ── T1 : Extract + Load ──────────────
+    t1 = PythonOperator(
+        task_id="telecharger_et_inserer_prices",
+        python_callable=telecharger_et_inserer_prices,
+        retries=3,
+        retry_delay=timedelta(minutes=5)
+    )
+
+    # ── T2 : Transform SQLMesh ───────────
+    t2 = BashOperator(
+        task_id="transformer_sqlmesh",
+        bash_command="cd /opt/airflow/sqlmesh && sqlmesh run prod"
+    )
+
+    # ── T3 : Logger + Seuil ML ───────────
+    t3 = BranchPythonOperator(
+        task_id="logger_et_verifier_seuil",
+        python_callable=logger_et_verifier_seuil
+    )
+
+    t4 = TriggerDagRunOperator(
+        task_id="trigger_ml",
+        trigger_dag_id="pipeline_ml"
+    )
+
+    t5 = EmptyOperator(
+        task_id="fin"
+    )
+
+    t1 >> t2 >> t3 >> [t4, t5]
+```
+
+---
+
+### Modèles SQLMesh — identiques à avant ✅
+
+```
+sqlmesh/models/prices_leclerc.sql
+sqlmesh/models/prices_competitors.sql
+sqlmesh/models/products_ref.sql
+sqlmesh/models/prices_enriched.sql
+sqlmesh/models/price_analysis.sql
+```
+
+---
+
+**Structure finale :**
+
+```
+dags/
+├── pipeline_prices.py    ← DAG Airflow
+├── tasks.py              ← tout le code métier
+sqlmesh/
+├── config.yaml
+└── models/
+    ├── prices_leclerc.sql
+    ├── prices_competitors.sql
+    ├── products_ref.sql
+    ├── prices_enriched.sql
+    └── price_analysis.sql
+```
+
+Crée les fichiers et lance ! 👇

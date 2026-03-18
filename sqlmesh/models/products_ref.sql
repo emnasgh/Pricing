@@ -6,16 +6,21 @@ MODEL (
     dialect postgres
 );
 
-SELECT DISTINCT ON (raw_data->'product'->>'code')
-    raw_data->'product'->>'code'                               AS code,
-    raw_data->'product'->>'product_name'                       AS product_name,
-    raw_data->'product'->>'brands'                             AS brands,
-    raw_data->'product'->>'nutriscore_grade'                   AS nutriscore_grade,
-    raw_data->'product'->>'ecoscore_grade'                     AS ecoscore_grade,
-    CAST(raw_data->'product'->>'nova_group' AS INTEGER)        AS nova_group,
-    raw_data->'product'->>'source'                             AS source,
-    NOW()                                                      AS inserted_at,
-    NOW()                                                      AS updated_at
-FROM retail_pricing.prices_raw
-WHERE raw_data->'product'->>'code' IS NOT NULL
-ORDER BY raw_data->'product'->>'code', inserted_at DESC
+WITH ranked AS (
+    SELECT
+        raw_data->>'product_code'                                      AS code,
+        raw_data->>'product_name'                                      AS product_name,
+        ROW_NUMBER() OVER (
+            PARTITION BY raw_data->>'product_code'
+            ORDER BY api_updated DESC NULLS LAST
+        ) AS rn
+    FROM public.prices_raw
+    WHERE raw_data->>'product_code' IS NOT NULL
+)
+SELECT
+    code,
+    product_name,
+    NOW() AS inserted_at,
+    NOW() AS updated_at
+FROM ranked
+WHERE rn = 1

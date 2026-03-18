@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import psycopg2
 import requests
 import time
@@ -47,6 +47,20 @@ def update_watermark(dataset_name, new_date):
     print(f"Watermark mis à jour : {dataset_name} → {new_date}")
 
 
+def unix_to_datetime(ts):
+    """Convertit un timestamp Unix (secondes ou millisecondes) en datetime UTC."""
+    if ts is None:
+        return None
+    try:
+        ts = int(ts)
+        # si > 1e10 → millisecondes, sinon secondes
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
+
 def telecharger_prices(**context):
     os.makedirs(TMP_PATH, exist_ok=True)
     last_date = get_watermark('prices')
@@ -59,16 +73,14 @@ def telecharger_prices(**context):
         conn.close()
         print(f"Parquet chargé : {len(df)} lignes")
 
-        # sauvegarder dans fichier temporaire
         tmp_file = f"{TMP_PATH}/all_prices.json"
         df.to_json(tmp_file, orient="records")
         print(f"Sauvegardé dans {tmp_file}")
 
-        # passer le chemin via XCom
         context["ti"].xcom_push(key="source", value="parquet")
         context["ti"].xcom_push(key="tmp_file", value=tmp_file)
 
-    # Exécutions suivantes → API delta 
+    # ── Exécutions suivantes → API delta ──
     else:
         last_date_delta = last_date - timedelta(minutes=5)
         print(f"Delta depuis {last_date_delta} → API")
@@ -111,13 +123,10 @@ def telecharger_prices(**context):
 
         print(f"Téléchargé : {len(all_items)} lignes")
 
-        #  peu de données : XCom directement 
         if len(all_items) <= 5000:
             context["ti"].xcom_push(key="source", value="api_xcom")
             context["ti"].xcom_push(key="all_items", value=all_items)
             print("Données passées via XCom")
-
-        # beaucoup de données : fichier temporaire 
         else:
             tmp_file = f"{TMP_PATH}/all_prices.json"
             with open(tmp_file, "w") as f:
@@ -125,7 +134,8 @@ def telecharger_prices(**context):
             context["ti"].xcom_push(key="source", value="api_file")
             context["ti"].xcom_push(key="tmp_file", value=tmp_file)
             print(f"Données sauvegardées dans {tmp_file}")
-            
+
+
 def inserer_prices_raw(**context):
     ti     = context["ti"]
     source = ti.xcom_pull(task_ids="telecharger_prices", key="source")
@@ -147,33 +157,39 @@ def inserer_prices_raw(**context):
     cursor = conn.cursor()
 
     rows_inserted = 0
-    rows_updated  = 0
+    rows_ignored  = 0
     rows_rejected = 0
-    start_time    = time.time()
 
     for item in all_items:
-        
-        cursor.execute("""
-        INSERT INTO prices_raw (id, raw_data, inserted_at)
-        VALUES (%s, %s, NOW())
-        ON CONFLICT (id) DO NOTHING   ← si id existe → ignorer
-        """, (item["id"], json.dumps(item)))
-        rows_inserted += 1
+        try:
+            api_updated = unix_to_datetime(item.get("updated"))
+
+            cursor.execute("""
+                INSERT INTO prices_raw (id, raw_data, api_updated, inserted_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (id, api_updated) DO NOTHING
+            """, (item["id"], json.dumps(item), api_updated))
+
+            if cursor.rowcount == 1:
+                rows_inserted += 1
+            else:
+                rows_ignored += 1
+
+        except Exception as e:
+            rows_rejected += 1
+            conn.rollback()  # reset la transaction pour ne pas bloquer les lignes suivantes
+            print(f"Erreur insertion id={item.get('id')}: {e}")
 
     conn.commit()
 
-    # ── watermark ────────────────────────
-    if source == "parquet":
-        max_date = max(item.get("created", "") for item in all_items)
-    else:
-        max_date = max(item["updated"] for item in all_items)
+    # watermark → max updated converti en datetime
+    valid_dates = [unix_to_datetime(item.get("updated")) for item in all_items]
+    valid_dates = [d for d in valid_dates if d is not None]
+    if valid_dates:
+        max_date = max(valid_dates)
+        update_watermark("prices", max_date)
 
-    update_watermark("prices", max_date)
-
-    duration = time.time() - start_time
-
-
-    print(f"Inséré : {rows_inserted} | Mis à jour : {rows_updated} | Rejeté : {rows_rejected}")
+    print(f"Inséré : {rows_inserted} | Ignoré : {rows_ignored} | Rejeté : {rows_rejected}")
 
     cursor.close()
     conn.close()
