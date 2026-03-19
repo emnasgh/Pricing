@@ -10,7 +10,7 @@ all_items = []
 for i, page in enumerate(pages):
     r = requests.get(API_URL, params={"page": page, "size": 100})
     all_items.extend(r.json()["items"])
-    print(f"{i+1}/100 ✅", end="\r")
+    print(f"{i+1}/100 ", end="\r")
 
 # chercher non-food
 found = set()
