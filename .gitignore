@@ -1,4 +1,7 @@
-logs/ 
-tmp/ 
-__pycache__/ 
-*.pyc 
+data/
+*.parquet
+*.jsonl
+*.jsonl.gz
+__pycache__/
+*.pyc
+logs/
