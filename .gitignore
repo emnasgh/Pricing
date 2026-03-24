@@ -1,0 +1,10 @@
+data/
+*.parquet
+*.jsonl
+*.jsonl.gz
+__pycache__/
+*.pyc
+logs/ 
+sqlmesh/logs/ 
+sqlmesh/logs/ 
+retail_pricing_backup.sql 
