@@ -7,19 +7,100 @@ import gzip
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from datetime import datetime, timezone
+import requests
+from decimal import Decimal
+from datetime import datetime, date, timezone
 from common import get_db_connection, log_pipeline
 
-PARQUET_PATH_food   = "/opt/airflow/data/food.parquet"
-PARQUET_PATH_beauty = "/opt/airflow/data/beauty.parquet"
-PARQUET_PATH_prices = "/opt/airflow/data/prices.parquet"
-JSONL_PATH_other    = "/opt/airflow/data/openproductsfacts-products.jsonl"
-
 CHUNK = 20000  # augmenté pour accélérer
+
+DATA_PATH           = "/opt/airflow/data"
+PARQUET_PATH_prices = f"{DATA_PATH}/prices.parquet"
+PARQUET_PATH_food   = f"{DATA_PATH}/food.parquet"
+PARQUET_PATH_beauty = f"{DATA_PATH}/beauty.parquet"
+JSONL_PATH_other    = f"{DATA_PATH}/openproductsfacts-products.jsonl"
+
+URL_PRICES = "https://www.data.gouv.fr/api/1/datasets/r/49716ed5-aacf-4692-8b2d-3cc6d15bf1d1"
+URL_FOOD   = "https://www.data.gouv.fr/api/1/datasets/r/05b27bd4-7294-4753-9228-fe035a35b110"
+URL_BEAUTY = "https://www.data.gouv.fr/api/1/datasets/r/5ee7a3da-4ac9-45a5-9175-7d7f71349275"
+URL_OTHER  = "https://www.data.gouv.fr/api/1/datasets/r/53104bea-7cd5-4dbe-b421-54b7a56c8dba"
+
+
+def telecharger_fichier(url, dest_path, name):
+    # si le fichier final existe déjà (ex: .jsonl déjà décompressé)
+    final_path = dest_path[:-3] if dest_path.endswith(".gz") else dest_path
+    if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+        print(f"{name} déjà présent : skip")
+        return
+    
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    print(f"Téléchargement {name}...")
+
+    headers  = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, stream=True, timeout=600, headers=headers)
+    response.raise_for_status()
+
+    total = 0
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            f.write(chunk)
+            total += len(chunk)
+            print(f"{name}: {round(total / 1024 / 1024, 1)} MB", end="\r")
+
+    print(f"\n{name} téléchargé : {dest_path}")
+
+
+def decompress_if_needed(path, name):
+    if not os.path.exists(path):
+        print(f"{name} .gz introuvable : skip décompression")
+        return
+    if path.endswith(".gz"):
+        out_path = path[:-3]
+        print(f"Décompression {name}...")
+        with gzip.open(path, "rb") as f_in:
+            with open(out_path, "wb") as f_out:
+                f_out.write(f_in.read())
+        os.remove(path)
+        print(f"{name} décompressé : {out_path}")
+
+        
+def telecharger_et_convertir_beauty():
+    if os.path.exists(PARQUET_PATH_beauty) and os.path.getsize(PARQUET_PATH_beauty) > 0:
+        print("beauty déjà présent : skip")
+        return
+
+    tsv_path = PARQUET_PATH_beauty.replace(".parquet", ".tsv")
+    print("Téléchargement beauty (TSV)...")
+    headers  = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(URL_BEAUTY, stream=True, timeout=600, headers=headers)
+    response.raise_for_status()
+
+    with open(tsv_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            f.write(chunk)
+    print("beauty TSV téléchargé → conversion en parquet...")
+
+    df = pd.read_csv(tsv_path, sep="\t", low_memory=False, on_bad_lines='skip')
+    df.to_parquet(PARQUET_PATH_beauty, index=False)
+    os.remove(tsv_path)
+    print(f"beauty converti : {PARQUET_PATH_beauty}")
+
+        
+def telecharger_fichiers(**context):
+    telecharger_fichier(URL_FOOD,   PARQUET_PATH_food,        "food")
+    telecharger_fichier(URL_PRICES, PARQUET_PATH_prices,      "prices")
+    telecharger_fichier(URL_OTHER,  JSONL_PATH_other + ".gz", "other")
+    decompress_if_needed(           JSONL_PATH_other + ".gz", "other")
+    telecharger_et_convertir_beauty()
+    print("Tous les fichiers sont téléchargés")
 
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, date):        
+            return obj.isoformat() 
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, np.integer):
@@ -103,7 +184,7 @@ def charger_parquet_products(parquet_path, id_field, table, conn, source, skip_r
         if id_field not in df.columns:
             continue
 
-        # garder id comme VARCHAR — cohérent avec la colonne products_raw.id
+        # id comme VARCHAR 
         df = df[df[id_field].notna()].copy()
         df[id_field] = df[id_field].astype(str).str.strip()
         df = df[df[id_field] != ''].copy()
@@ -132,20 +213,29 @@ def charger_parquet_products(parquet_path, id_field, table, conn, source, skip_r
             except Exception:
                 continue
 
-        n         = inserer_via_copy(rows, table, conn)
+        n = inserer_via_copy(rows, table, conn)
         inserted += n
         print(f"{source} chunk {chunk_num} ({len(rows)} lignes) | +{n} | total : {inserted}")
 
     return inserted
 
 
-def charger_parquet_prices(parquet_path, table, conn, source):
-    """Lit prices.parquet par chunks PyArrow."""
+def charger_parquet_prices(parquet_path, table, conn, source, skip_rows=0):
+    """Lit prices.parquet par chunks PyArrow avec reprise."""
     pf        = pq.ParquetFile(parquet_path)
     inserted  = 0
     chunk_num = 0
+    skipped   = 0
 
     for batch in pf.iter_batches(batch_size=CHUNK):
+        chunk_num += 1
+
+        # LOGIQUE DE REPRISE
+        if skipped < skip_rows:
+            skipped += CHUNK
+            print(f"{source} chunk {chunk_num} → skip ({skipped}/{skip_rows})")
+            continue
+
         df = batch.to_pandas()
 
         if "id" not in df.columns:
@@ -164,21 +254,24 @@ def charger_parquet_prices(parquet_path, table, conn, source):
         for _, row in df.iterrows():
             item = row.to_dict()
             item.pop("_api_updated", None)
+
             api_updated = row.get("_api_updated")
             if api_updated is not None and pd.isna(api_updated):
                 api_updated = None
+
             try:
                 rows.append((
                     str(int(row["id"])),
                     to_json_safe(item),
                     api_updated.to_pydatetime() if hasattr(api_updated, 'to_pydatetime') else api_updated
                 ))
-            except Exception:
+            except Exception as e:
+                print(f"Erreur ligne : {e}")
                 continue
 
-        n          = inserer_via_copy(rows, table, conn)
-        inserted  += n
-        chunk_num += 1
+        n = inserer_via_copy(rows, table, conn)
+        inserted += n
+
         print(f"{source} chunk {chunk_num} ({len(rows)} lignes) | +{n} | total : {inserted}")
 
     return inserted
@@ -223,8 +316,8 @@ def charger_jsonl(jsonl_path, table, conn, source):
 
                 if len(batch) >= CHUNK:
                     try:
-                        n          = inserer_via_copy(batch, table, conn)
-                        inserted  += n
+                        n = inserer_via_copy(batch, table, conn)
+                        inserted += n
                         chunk_num += 1
                         print(f"{source} chunk {chunk_num} | +{n} | total : {inserted}")
                     except Exception as e:
@@ -237,7 +330,7 @@ def charger_jsonl(jsonl_path, table, conn, source):
 
     if batch:
         try:
-            n         = inserer_via_copy(batch, table, conn)
+            n = inserer_via_copy(batch, table, conn)
             inserted += n
             print(f"{source} dernier chunk | +{n} | total : {inserted}")
         except Exception as e:
@@ -256,6 +349,7 @@ def seed_prices(**context):
     status        = "failed"
 
     try:
+        #  COUNT DB
         conn   = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM prices_raw")
@@ -263,16 +357,28 @@ def seed_prices(**context):
         cursor.close()
         conn.close()
 
-        if count > 0:
-            print(f"Déjà seedé ({count} lignes) → skip")
+        #  TOTAL PARQUET
+        total_parquet = pq.ParquetFile(PARQUET_PATH_prices).metadata.num_rows
+
+        print(f"Parquet : {total_parquet} | Déjà en base : {count}")
+
+        if count >= total_parquet:
+            print("Prices déjà seedés → skip")
             status = "success"
             return
 
-        print("Seed prices : PyArrow streaming → PostgreSQL COPY...")
-        conn          = get_db_connection()
+        print(f"Reprise à partir de {count} lignes...")
+
+        conn = get_db_connection()
+
         rows_inserted = charger_parquet_prices(
-            PARQUET_PATH_prices, "prices_raw", conn, "Prices"
+            PARQUET_PATH_prices,
+            "prices_raw",
+            conn,
+            "Prices",
+            skip_rows=count
         )
+
         conn.close()
 
         status = "success"
@@ -283,9 +389,19 @@ def seed_prices(**context):
         error_message = str(e)
         print(f"Erreur : {e}")
         raise
+
     finally:
         duration = time.time() - start_time
-        log_pipeline("pipeline_seed", "seed_prices", rows_inserted, rows_ignored, rows_errors, status, duration, error_message)
+        log_pipeline(
+            "pipeline_seed",
+            "seed_prices",
+            rows_inserted,
+            rows_ignored,
+            rows_errors,
+            status,
+            duration,
+            error_message
+        )
 
 
 def seed_products(**context):
@@ -313,7 +429,10 @@ def seed_products(**context):
         conn = get_db_connection()
 
         if count < total_parquet:
-            skip_food = min(count, total_food)
+            skip_food   = min(count, total_food)
+            # FIX : reprise correcte pour beauty — on déduit les lignes food déjà chargées
+            skip_beauty = max(0, count - total_food)
+
             print(f"Chargement food (reprise à partir de {skip_food} lignes)...")
             n              = charger_parquet_products(
                 PARQUET_PATH_food, "code", "products_raw", conn, "Food",
@@ -322,10 +441,10 @@ def seed_products(**context):
             rows_inserted += n
             print(f"Food terminé : {n} lignes insérées cette session")
 
-            print("Chargement beauty...")
+            print(f"Chargement beauty (reprise à partir de {skip_beauty} lignes)...")
             n              = charger_parquet_products(
                 PARQUET_PATH_beauty, "code", "products_raw", conn, "Beauty",
-                skip_rows=0
+                skip_rows=skip_beauty  # FIX : était toujours 0
             )
             rows_inserted += n
             print(f"Beauty terminé : {n} lignes insérées")
@@ -348,6 +467,16 @@ def seed_products(**context):
         error_message = str(e)
         print(f"Erreur : {e}")
         raise
+
     finally:
         duration = time.time() - start_time
-        log_pipeline("pipeline_seed", "seed_products", rows_inserted, rows_ignored, rows_errors, status, duration, error_message)
+        log_pipeline(
+            "pipeline_seed",
+            "seed_products",
+            rows_inserted,
+            rows_ignored,
+            rows_errors,
+            status,
+            duration,
+            error_message
+        )

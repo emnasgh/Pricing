@@ -4,7 +4,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.operators.empty import EmptyOperator
 from datetime import datetime, timedelta
-from tasks import telecharger_prices, inserer_prices_raw
+from tasks import telecharger_prices, inserer_prices_raw 
 
 with DAG(
     dag_id="pipeline_prices",
@@ -12,7 +12,7 @@ with DAG(
     schedule="@daily",
     catchup=False
 ) as dag:
-
+    
     #  T1 : Extract 
     t1 = PythonOperator(
         task_id="telecharger_prices",
@@ -34,6 +34,6 @@ with DAG(
         bash_command="cd /opt/airflow/sqlmesh && sqlmesh plan --auto-apply"
     )
 
-    t1 >> t2 >> t3
+    t1 >> t2 
   
 

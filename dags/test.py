@@ -1,5 +1,7 @@
-import duckdb
-conn = duckdb.connect()
-df = conn.execute("SELECT * FROM read_parquet('/opt/airflow/data/prices.parquet') LIMIT 1").df()
-print(list(df.columns))
-conn.close()
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('/opt/airflow/data/prices.parquet')
+batch = next(pf.iter_batches(batch_size=3))
+df = batch.to_pandas()
+print(df.columns.tolist())
+print(df.dtypes)
+print(df.head(3))

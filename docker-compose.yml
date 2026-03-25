@@ -6,9 +6,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:admin123@postgres:5432/airflow_db
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LAZY_LOAD_PLUGINS: 'False'
-    AIRFLOW__SCHEDULER__JOB_HEARTBEAT_SEC: 600
-    AIRFLOW__SCHEDULER__ZOMBIE_TASK_THRESHOLD: 3600
-    AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC: 600
+    AIRFLOW__SCHEDULER__JOB_HEARTBEAT_SEC: 30
+    AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC: 10
+    AIRFLOW__SCHEDULER__ZOMBIE_TASK_THRESHOLD: 600
     AIRFLOW__SCHEDULER__MAX_DAGRUNS_PER_LOOP_TO_SCHEDULE: 1
   volumes:
     - ./dags:/opt/airflow/dags
@@ -71,7 +71,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 6g
+          memory: 4g
 
 networks:
   airflow-net:
