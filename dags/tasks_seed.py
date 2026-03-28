@@ -12,7 +12,7 @@ from decimal import Decimal
 from datetime import datetime, date, timezone
 from common import get_db_connection, log_pipeline
 
-CHUNK = 20000  # augmenté pour accélérer
+CHUNK = 20000 
 
 DATA_PATH           = "/opt/airflow/data"
 PARQUET_PATH_prices = f"{DATA_PATH}/prices.parquet"
@@ -184,11 +184,10 @@ def charger_parquet_products(parquet_path, id_field, table, conn, source, skip_r
         if id_field not in df.columns:
             continue
 
-        # id comme VARCHAR 
-        df = df[df[id_field].notna()].copy()
-        df[id_field] = df[id_field].astype(str).str.strip()
-        df = df[df[id_field] != ''].copy()
-        df = df[df[id_field] != 'nan'].copy()
+        df = df[df[id_field].notna()].copy()      # supprime les lignes sans id (NULL) → ON NE PEUT PAS insérer sans clé
+        df[id_field] = df[id_field].astype(str).str.strip()  # cast en string → la colonne id en DB est VARCHAR
+        df = df[df[id_field] != ''].copy()        # supprime id vide ""  → clé inutilisable
+        df = df[df[id_field] != 'nan'].copy()     # supprime id = "nan" → artefact pandas lors du cast
 
         if "last_modified_t" in df.columns:
             df["_api_updated"] = pd.to_datetime(
@@ -281,7 +280,7 @@ def charger_jsonl(jsonl_path, table, conn, source):
     """Lit le JSONL (gz ou non) ligne par ligne — zéro RAM."""
     inserted  = 0
     chunk_num = 0
-    batch     = []
+    batch =[]
 
     try:
         conn.rollback()
@@ -310,7 +309,7 @@ def charger_jsonl(jsonl_path, table, conn, source):
                 if not code:
                     continue
 
-                ts          = item.get("last_modified_t")
+                ts = item.get("last_modified_t")
                 api_updated = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
                 batch.append((code, to_json_safe(item), api_updated))
 
@@ -434,7 +433,7 @@ def seed_products(**context):
             skip_beauty = max(0, count - total_food)
 
             print(f"Chargement food (reprise à partir de {skip_food} lignes)...")
-            n              = charger_parquet_products(
+            n = charger_parquet_products(
                 PARQUET_PATH_food, "code", "products_raw", conn, "Food",
                 skip_rows=skip_food
             )
@@ -442,9 +441,9 @@ def seed_products(**context):
             print(f"Food terminé : {n} lignes insérées cette session")
 
             print(f"Chargement beauty (reprise à partir de {skip_beauty} lignes)...")
-            n              = charger_parquet_products(
+            n = charger_parquet_products(
                 PARQUET_PATH_beauty, "code", "products_raw", conn, "Beauty",
-                skip_rows=skip_beauty  # FIX : était toujours 0
+                skip_rows=skip_beauty
             )
             rows_inserted += n
             print(f"Beauty terminé : {n} lignes insérées")
